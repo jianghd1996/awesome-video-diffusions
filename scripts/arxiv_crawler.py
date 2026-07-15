@@ -1,21 +1,33 @@
-import arxiv
 import datetime
+import email.utils
 import json
 import os
 import re
 import sys
+import tempfile
 import time
 import requests
 import argparse
-from typing import List, Dict, Optional, Tuple
+import xml.etree.ElementTree as ET
+from typing import Callable, List, Dict, Optional, Tuple
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from utils.logger import setup_logger
-from requests.exceptions import RequestException
-import urllib3
+from paper_data import PaperValidationError, validate_papers
 
-# 禁用 SSL 警告，因为我们会强制使用 HTTP
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+ARXIV_API_URL = "https://export.arxiv.org/api/query"
+ARXIV_PAGE_SIZE = 500
+ARXIV_REQUEST_ATTEMPTS = 4
+ARXIV_RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+ARXIV_USER_AGENT = (
+    "awesome-video-diffusions/1.0 "
+    "(https://github.com/longxiang-ai/awesome-video-diffusions)"
+)
+
+
+class ArxivFetchError(RuntimeError):
+    """Raised when a complete, valid arXiv result cannot be fetched."""
 
 
 @dataclass
@@ -63,7 +75,9 @@ def parse_relative_period(period_str: str) -> datetime.timedelta:
 
 class ArxivCrawler:
     def __init__(self, fetch_citations: bool = False, fetch_bibtex: bool = False,
-                 date_from: str = None, date_to: str = None, recent: str = None):
+                 date_from: str = None, date_to: str = None, recent: str = None,
+                 session: Optional[requests.Session] = None,
+                 sleep_fn: Callable[[float], None] = time.sleep):
         self.logger = setup_logger("arxiv_crawler")
         self.output_dir = Path("data")
         self.output_dir.mkdir(exist_ok=True)
@@ -85,6 +99,9 @@ class ArxivCrawler:
         self.fetch_citations = fetch_citations
         self.fetch_bibtex = fetch_bibtex
         self.semantic_api_url = "https://api.semanticscholar.org/v1/paper/arXiv:"
+        self.session = session or requests.Session()
+        self.session.headers.update({"User-Agent": ARXIV_USER_AGENT})
+        self.sleep_fn = sleep_fn
 
         # Load keywords configuration
         try:
@@ -519,113 +536,181 @@ class ArxivCrawler:
     #  Search methods
     # ------------------------------------------------------------------ #
 
-    def _direct_arxiv_search(self, max_results: int = 50) -> List[Paper]:
-        """直接使用requests访问arXiv API的备用搜索方法"""
+    def _retry_after_seconds(self, response: Optional[requests.Response]) -> Optional[float]:
+        if response is None:
+            return None
+        value = response.headers.get("Retry-After")
+        if not value:
+            return None
         try:
-            import xml.etree.ElementTree as ET
-            import urllib.parse
+            return min(60.0, max(0.0, float(value)))
+        except ValueError:
+            try:
+                retry_at = email.utils.parsedate_to_datetime(value)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=datetime.timezone.utc)
+                now = datetime.datetime.now(datetime.timezone.utc)
+                return min(60.0, max(0.0, (retry_at - now).total_seconds()))
+            except (TypeError, ValueError, OverflowError):
+                return None
 
-            base_url = "http://export.arxiv.org/api/query"
+    def _parse_arxiv_entry(self, entry: ET.Element) -> Paper:
+        namespaces = {"atom": "http://www.w3.org/2005/Atom"}
+        title = entry.findtext("atom:title", default="", namespaces=namespaces).strip()
+        abstract = entry.findtext(
+            "atom:summary", default="", namespaces=namespaces
+        ).strip().replace("\n", " ")
+        published = entry.findtext(
+            "atom:published", default="", namespaces=namespaces
+        ).strip()
 
-            params = {
-                'search_query': self.search_query,
-                'start': 0,
-                'max_results': max_results,
-                'sortBy': 'submittedDate',
-                'sortOrder': 'descending'
-            }
+        authors = []
+        for author in entry.findall("atom:author", namespaces):
+            name = author.findtext("atom:name", default="", namespaces=namespaces).strip()
+            if name:
+                authors.append(name)
 
-            query_string = urllib.parse.urlencode(params)
-            full_url = f"{base_url}?{query_string}"
+        arxiv_url = ""
+        pdf_url = ""
+        for link in entry.findall("atom:link", namespaces):
+            href = link.get("href", "")
+            if link.get("rel", "") == "alternate":
+                arxiv_url = href
+            elif link.get("title") == "pdf":
+                pdf_url = href
 
-            self.logger.info(f"直接访问 arXiv API: {full_url}")
+        categories = [
+            category.get("term", "")
+            for category in entry.findall("atom:category", namespaces)
+            if category.get("term", "")
+        ]
+        keywords = self._extract_keywords(abstract, title)
+        github_url = self._find_github_url(abstract, title) or ""
+        all_links = self._extract_all_links(abstract, arxiv_url, pdf_url, title)
+        if github_url and "github" not in all_links:
+            all_links["github"] = github_url
 
-            response = requests.get(full_url, timeout=30)
-            response.raise_for_status()
+        arxiv_id = self._get_arxiv_id(arxiv_url) if arxiv_url else ""
+        citations, semantic_url = (
+            self._get_citations(arxiv_id) if self.fetch_citations and arxiv_id else (0, "")
+        )
+        bibtex = ""
+        if self.fetch_bibtex and arxiv_id:
+            bibtex = self._fetch_bibtex(arxiv_id)
+            self.sleep_fn(0.3)
 
-            root = ET.fromstring(response.content)
+        return Paper(
+            title=title,
+            authors=authors,
+            abstract=abstract,
+            arxiv_url=arxiv_url,
+            pdf_url=pdf_url,
+            published_date=published[:10],
+            categories=categories,
+            github_url=github_url,
+            keywords=keywords,
+            citations=citations,
+            semantic_url=semantic_url,
+            links=all_links,
+            bibtex=bibtex,
+        )
 
-            namespaces = {
-                'atom': 'http://www.w3.org/2005/Atom',
-                'arxiv': 'http://arxiv.org/schemas/atom'
-            }
+    def _parse_arxiv_page(
+        self, content: bytes, start: int, page_size: int
+    ) -> Tuple[List[Paper], int]:
+        root = ET.fromstring(content)
+        namespaces = {
+            "atom": "http://www.w3.org/2005/Atom",
+            "opensearch": "http://a9.com/-/spec/opensearch/1.1/",
+        }
+        total_text = root.findtext("opensearch:totalResults", namespaces=namespaces)
+        if total_text is None:
+            raise ArxivFetchError("arXiv response has no totalResults")
+        try:
+            total_results = int(total_text)
+        except ValueError as exc:
+            raise ArxivFetchError(
+                f"Invalid arXiv totalResults value: {total_text}"
+            ) from exc
+        if total_results <= 0:
+            raise ArxivFetchError("arXiv returned no matching papers")
 
-            papers = []
-            entries = root.findall('atom:entry', namespaces)
+        entries = root.findall("atom:entry", namespaces)
+        expected_entries = min(page_size, max(0, total_results - start))
+        if len(entries) != expected_entries:
+            raise ArxivFetchError(
+                f"Incomplete arXiv page at offset {start}: "
+                f"expected {expected_entries}, received {len(entries)}"
+            )
 
-            for entry in entries:
-                try:
-                    title_el = entry.find('atom:title', namespaces)
-                    title = title_el.text.strip() if title_el is not None else "No title"
+        papers = [self._parse_arxiv_entry(entry) for entry in entries]
+        validate_papers(papers)
+        return papers, total_results
 
-                    summary = entry.find('atom:summary', namespaces)
-                    abstract = summary.text.strip().replace('\n', ' ') if summary is not None else ""
+    def _request_arxiv_page(
+        self, start: int, page_size: int
+    ) -> Tuple[List[Paper], int]:
+        params = {
+            "search_query": self.search_query,
+            "start": start,
+            "max_results": page_size,
+            "sortBy": "submittedDate",
+            "sortOrder": "descending",
+        }
+        last_error: Optional[BaseException] = None
 
-                    authors = []
-                    for author in entry.findall('atom:author', namespaces):
-                        name = author.find('atom:name', namespaces)
-                        if name is not None:
-                            authors.append(name.text.strip())
-
-                    arxiv_url = ""
-                    pdf_url = ""
-                    for link in entry.findall('atom:link', namespaces):
-                        rel = link.get('rel', '')
-                        href = link.get('href', '')
-                        if rel == 'alternate':
-                            arxiv_url = href
-                        elif link.get('title') == 'pdf':
-                            pdf_url = href
-
-                    published = entry.find('atom:published', namespaces)
-                    published_date = published.text[:10] if published is not None else ""
-
-                    categories = []
-                    for category in entry.findall('atom:category', namespaces):
-                        term = category.get('term', '')
-                        if term:
-                            categories.append(term)
-
-                    keywords = self._extract_keywords(abstract, title)
-                    github_url = self._find_github_url(abstract, title) or ""
-                    all_links = self._extract_all_links(abstract, arxiv_url, pdf_url, title)
-                    if github_url and 'github' not in all_links:
-                        all_links['github'] = github_url
-
-                    # Fetch BibTeX if enabled
-                    bibtex = ""
-                    if self.fetch_bibtex and arxiv_url:
-                        aid = self._get_arxiv_id(arxiv_url)
-                        bibtex = self._fetch_bibtex(aid)
-                        time.sleep(0.3)  # rate limit
-
-                    paper = Paper(
-                        title=title,
-                        authors=authors,
-                        abstract=abstract,
-                        arxiv_url=arxiv_url,
-                        pdf_url=pdf_url,
-                        published_date=published_date,
-                        categories=categories,
-                        github_url=github_url,
-                        keywords=keywords,
-                        citations=0,
-                        semantic_url="",
-                        links=all_links,
-                        bibtex=bibtex
+        for attempt in range(ARXIV_REQUEST_ATTEMPTS):
+            response = None
+            try:
+                self.logger.info(
+                    "Requesting arXiv offset %s, size %s (attempt %s/%s)",
+                    start,
+                    page_size,
+                    attempt + 1,
+                    ARXIV_REQUEST_ATTEMPTS,
+                )
+                response = self.session.get(
+                    ARXIV_API_URL,
+                    params=params,
+                    timeout=(10, 45),
+                )
+                if response.status_code in ARXIV_RETRYABLE_STATUSES:
+                    raise ArxivFetchError(
+                        f"Retryable arXiv HTTP status: {response.status_code}"
                     )
-                    papers.append(paper)
-                    self.logger.info(f"[Direct API] Successfully processed paper: {title}")
+                if response.status_code != 200:
+                    raise ArxivFetchError(
+                        f"Non-retryable arXiv HTTP status: {response.status_code}"
+                    )
+                return self._parse_arxiv_page(response.content, start, page_size)
+            except (
+                requests.Timeout,
+                requests.ConnectionError,
+                ET.ParseError,
+                PaperValidationError,
+                ArxivFetchError,
+            ) as exc:
+                last_error = exc
+                non_retryable = (
+                    response is not None
+                    and response.status_code not in ARXIV_RETRYABLE_STATUSES
+                    and response.status_code != 200
+                )
+                if non_retryable or attempt == ARXIV_REQUEST_ATTEMPTS - 1:
+                    break
 
-                except Exception as e:
-                    self.logger.error(f"Error processing paper from direct API: {e}")
-                    continue
+                retry_after = self._retry_after_seconds(response)
+                delay = retry_after if retry_after is not None else float(2 ** (attempt + 1))
+                self.logger.warning(
+                    "arXiv request failed: %s. Retrying in %.1f seconds.",
+                    exc,
+                    delay,
+                )
+                self.sleep_fn(delay)
 
-            return papers
-
-        except Exception as e:
-            self.logger.error(f"Direct arXiv API search failed: {e}")
-            return []
+        raise ArxivFetchError(
+            f"Unable to fetch a complete arXiv page at offset {start}: {last_error}"
+        ) from last_error
 
     def search_papers(self, max_results: int = None) -> List[Paper]:
         """Search papers on arXiv.
@@ -636,177 +721,74 @@ class ArxivCrawler:
             config_max = self.user_config.get("search", {}).get("max_results")
             max_results = config_max if config_max else 1000
 
-        try:
-            # 首先尝试直接API方法
-            self.logger.info("尝试直接 API 方法来绕过重定向问题...")
-            papers = self._direct_arxiv_search(max_results)
+        if not isinstance(max_results, int) or max_results <= 0:
+            raise ArxivFetchError(f"max_results must be positive, got {max_results}")
 
-            if papers:
-                self.logger.info(f"直接 API 方法成功获取 {len(papers)} 篇论文")
-                papers = self._filter_by_date(papers)
-                return papers
+        papers: List[Paper] = []
+        total_available: Optional[int] = None
+        expected_count = max_results
+        start = 0
 
-            # 如果直接API失败，使用原始方法
-            self.logger.info("直接 API 方法失败，尝试使用 arxiv 库...")
+        while start < expected_count:
+            page_size = min(ARXIV_PAGE_SIZE, expected_count - start)
+            page, page_total = self._request_arxiv_page(start, page_size)
+            if total_available is None:
+                total_available = page_total
+                expected_count = min(max_results, total_available)
+            elif page_total != total_available:
+                raise ArxivFetchError(
+                    f"arXiv totalResults changed from {total_available} to {page_total}"
+                )
 
-            client = arxiv.Client(
-                page_size=100,
-                delay_seconds=3,
-                num_retries=3
+            papers.extend(page)
+            start += len(page)
+            if start < expected_count:
+                self.sleep_fn(3.0)
+
+        if len(papers) != expected_count:
+            raise ArxivFetchError(
+                f"Incomplete arXiv result: expected {expected_count}, received {len(papers)}"
             )
 
-            try:
-                import arxiv.arxiv as arxiv_module
-                original_base_url = getattr(arxiv_module, 'BASE_URL', None)
-                if original_base_url:
-                    arxiv_module.BASE_URL = "http://export.arxiv.org/api/"
-                    self.logger.info("成功切换到 HTTP 端点")
-            except Exception as e:
-                self.logger.warning(f"无法修改 arXiv 端点，使用默认设置: {e}")
+        papers = self._filter_by_date(papers)
+        if not papers:
+            raise ArxivFetchError("No papers remain after applying the date filter")
+        validate_papers(papers)
+        self.logger.info("Total papers collected: %s", len(papers))
+        return papers
 
-            search = arxiv.Search(
-                query=self.search_query,
-                max_results=max_results,
-                sort_by=arxiv.SortCriterion.SubmittedDate,
-                sort_order=arxiv.SortOrder.Descending
-            )
-
-            papers = []
-            processed_count = 0
-            retry_count = 0
-            max_retries = 3
-
-            while retry_count < max_retries:
-                try:
-                    self.logger.info(f"尝试获取论文，第 {retry_count + 1} 次尝试...")
-
-                    for result in client.results(search):
-                        try:
-                            arxiv_id = result.entry_id.split('/')[-1]
-                            citations, semantic_url = self._get_citations(arxiv_id) if self.fetch_citations else (0, '')
-
-                            abstract = result.summary.replace('\n', ' ').strip()
-                            github_url = self._find_github_url(abstract, result.title.strip())
-                            keywords = self._extract_keywords(abstract, result.title.strip())
-                            all_links = self._extract_all_links(
-                                abstract, result.entry_id, result.pdf_url, result.title.strip()
-                            )
-                            if github_url and 'github' not in all_links:
-                                all_links['github'] = github_url
-
-                            bibtex = ""
-                            if self.fetch_bibtex:
-                                bibtex = self._fetch_bibtex(arxiv_id)
-                                time.sleep(0.3)
-
-                            paper = Paper(
-                                title=result.title.strip(),
-                                authors=[author.name.strip() for author in result.authors],
-                                abstract=abstract,
-                                arxiv_url=result.entry_id,
-                                pdf_url=result.pdf_url,
-                                published_date=result.published.strftime("%Y-%m-%d"),
-                                categories=[cat for cat in result.categories],
-                                github_url=github_url or "",
-                                keywords=keywords,
-                                citations=citations,
-                                semantic_url=semantic_url,
-                                links=all_links,
-                                bibtex=bibtex
-                            )
-                            papers.append(paper)
-                            processed_count += 1
-                            self.logger.info(f"Successfully processed paper: {paper.title}")
-                        except Exception as e:
-                            self.logger.error(f"Error processing single paper: {e}")
-                            continue
-
-                    if papers:
-                        break
-
-                except Exception as e:
-                    retry_count += 1
-                    error_msg = str(e)
-
-                    if "HTTP 301" in error_msg or "301" in error_msg:
-                        self.logger.warning(f"遇到重定向错误，第 {retry_count} 次重试: {e}")
-                        if retry_count < max_retries:
-                            time.sleep(5)
-                            continue
-                    elif "Page of results was unexpectedly empty" in error_msg:
-                        self.logger.info(f"Reached end of available results. Successfully processed {processed_count} papers.")
-                        break
-                    elif "HTTP" in error_msg and retry_count < max_retries:
-                        self.logger.warning(f"遇到网络错误，第 {retry_count} 次重试: {e}")
-                        time.sleep(10)
-                        continue
-                    else:
-                        self.logger.warning(f"Search interrupted: {e}. Continuing with {processed_count} papers collected so far.")
-                        break
-
-            # 降级策略
-            if not papers and retry_count >= max_retries:
-                self.logger.warning("所有重试都失败了，尝试使用更简单的搜索查询...")
-                try:
-                    simple_search = arxiv.Search(
-                        query='abs:"video diffusion" OR abs:"video generation"',
-                        max_results=min(50, max_results),
-                        sort_by=arxiv.SortCriterion.SubmittedDate,
-                        sort_order=arxiv.SortOrder.Descending
-                    )
-
-                    for result in client.results(simple_search):
-                        try:
-                            paper = Paper(
-                                title=result.title.strip(),
-                                authors=[author.name.strip() for author in result.authors],
-                                abstract=result.summary.replace('\n', ' ').strip(),
-                                arxiv_url=result.entry_id,
-                                pdf_url=result.pdf_url,
-                                published_date=result.published.strftime("%Y-%m-%d"),
-                                categories=[cat for cat in result.categories],
-                                github_url="",
-                                keywords=[],
-                                citations=0,
-                                semantic_url="",
-                                links={},
-                                bibtex=""
-                            )
-                            papers.append(paper)
-                            processed_count += 1
-                            self.logger.info(f"[Fallback] Successfully processed paper: {paper.title}")
-                        except Exception as e:
-                            self.logger.error(f"Error processing fallback paper: {e}")
-                            continue
-
-                except Exception as e:
-                    self.logger.error(f"Fallback search also failed: {e}")
-
-            # Apply date filter
-            papers = self._filter_by_date(papers)
-
-            self.logger.info(f"Total papers collected: {len(papers)}")
-            return papers
-
-        except Exception as e:
-            self.logger.error(f"Error searching papers: {e}")
-            self.logger.warning("返回空的论文列表以确保程序继续运行")
-            return []
-
-    def save_papers(self, papers: List[Paper]):
-        """保存论文信息到JSON文件"""
-        try:
-            today = datetime.datetime.now().strftime("%Y-%m-%d")
+    def save_papers(
+        self, papers: List[Paper], output_file: Optional[Path] = None
+    ) -> Path:
+        """Validate and atomically save paper data."""
+        papers_dict = validate_papers(papers)
+        if output_file is None:
+            today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
             output_file = self.output_dir / f"papers_{today}.json"
+        output_file = Path(output_file)
+        output_file.parent.mkdir(parents=True, exist_ok=True)
 
-            papers_dict = [paper.to_dict() for paper in papers]
-            with open(output_file, "w", encoding="utf-8") as f:
-                json.dump(papers_dict, f, ensure_ascii=False, indent=2)
-
-            self.logger.info(f"成功保存{len(papers)}篇论文到{output_file}")
-        except Exception as e:
-            self.logger.error(f"保存论文数据时出错: {e}")
-            raise
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=output_file.parent,
+                prefix=f".{output_file.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temporary_path = Path(handle.name)
+                json.dump(papers_dict, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+            os.replace(temporary_path, output_file)
+            self.logger.info(
+                "Saved %s validated papers to %s", len(papers_dict), output_file
+            )
+            return output_file
+        finally:
+            if temporary_path is not None and temporary_path.exists():
+                temporary_path.unlink()
 
 
 def main():

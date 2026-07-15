@@ -24,8 +24,6 @@ wheels/
 # Logs
 logs/
 *.log
-tests/
-
 # Environment variables
 .env
 

@@ -114,7 +114,7 @@ class KeywordGenerator:
         titles = []
         # Batch fetch using arXiv API
         ids_str = ",".join(arxiv_ids)
-        url = f"http://export.arxiv.org/api/query?id_list={ids_str}&max_results={len(arxiv_ids)}"
+        url = f"https://export.arxiv.org/api/query?id_list={ids_str}&max_results={len(arxiv_ids)}"
 
         try:
             response = requests.get(url, timeout=30)
