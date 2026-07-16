@@ -8,6 +8,7 @@ Usage:
     python main.py suggest              # Generate keywords from paper titles (LLM)
     python main.py export-bib           # Export BibTeX from paper data
     python main.py readme               # Generate README.md
+    python main.py update --report PATH # Transactional scheduled update
 
 Examples:
     python main.py init
@@ -50,6 +51,17 @@ def cmd_search(args):
         print(f"\n[OK] Saved {len(papers)} papers.")
     except Exception as e:
         print(f"[ERROR] Search failed: {e}")
+        sys.exit(1)
+
+
+def cmd_update(args):
+    """Run the transactional paper and README update pipeline."""
+    from update_pipeline import UpdatePipeline
+
+    pipeline = UpdatePipeline(project_root=PROJECT_ROOT)
+    report = pipeline.run(report_path=args.report, max_results=args.max_results)
+    print(f"[{report.status.upper()}] {report.message}")
+    if report.status == "failed":
         sys.exit(1)
 
 
@@ -125,12 +137,11 @@ def cmd_readme(args):
         generator = ReadmeGenerator()
         generator.show_latest_papers = args.show_latest
         generator.show_abstracts = args.show_abstracts
-        success = generator.generate_readme()
-        if success:
-            print("\n[OK] README.md generated successfully.")
-        else:
-            print("[ERROR] README generation failed.")
-            sys.exit(1)
+        output_path = generator.generate_readme(
+            input_path=args.input,
+            output_path=args.output,
+        )
+        print(f"\n[OK] README generated at {output_path}.")
     except Exception as e:
         print(f"[ERROR] README generator failed: {e}")
         sys.exit(1)
@@ -165,6 +176,16 @@ def build_parser() -> argparse.ArgumentParser:
                            help='Recent period filter (e.g., 30d, 6m, 1y, 2y)')
     sp_search.set_defaults(func=cmd_search)
 
+    # --- update ---
+    sp_update = subparsers.add_parser(
+        'update', help='Transactionally update paper data and README'
+    )
+    sp_update.add_argument('--report', type=Path, required=True,
+                           help='Path for the machine-readable update report')
+    sp_update.add_argument('--max-results', type=int, default=None,
+                           help='Maximum number of papers to fetch')
+    sp_update.set_defaults(func=cmd_update)
+
     # --- suggest ---
     sp_suggest = subparsers.add_parser('suggest', help='Generate keywords from paper titles (LLM)')
     sp_suggest.add_argument('--titles', nargs='+', type=str, default=None,
@@ -197,6 +218,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --- readme ---
     sp_readme = subparsers.add_parser('readme', help='Generate README.md')
+    sp_readme.add_argument('--input', type=Path, default=None,
+                           help='Explicit papers JSON file')
+    sp_readme.add_argument('--output', type=Path, default=None,
+                           help='README output path')
     sp_readme.add_argument('--show-latest', action='store_true',
                            help='Include latest papers section')
     sp_readme.add_argument('--show-abstracts', action='store_true',
